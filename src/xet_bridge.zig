@@ -21,6 +21,7 @@ pub const XetBridge = struct {
     allocator: std.mem.Allocator,
     io: Io,
     cfg: *const config.Config,
+    environ: std.process.Environ,
     cache: swarm_mod.XorbCache,
 
     /// CAS client (initialized after authentication).
@@ -55,12 +56,14 @@ pub const XetBridge = struct {
         allocator: std.mem.Allocator,
         io: Io,
         cfg: *const config.Config,
+        environ: std.process.Environ,
         swarm_downloader: ?*swarm_mod.SwarmDownloader,
     ) XetBridge {
         return .{
             .allocator = allocator,
             .io = io,
             .cfg = cfg,
+            .environ = environ,
             .cache = swarm_mod.XorbCache.init(allocator, io, cfg),
             .cas = null,
             .swarm_downloader = swarm_downloader,
@@ -124,6 +127,7 @@ pub const XetBridge = struct {
         self.cas = try cas_client.CasClient.init(
             self.allocator,
             self.io,
+            self.environ,
             cas_url,
             access_token,
         );
@@ -287,7 +291,7 @@ test "XetBridge init and deinit" {
     var cfg = try config.Config.init(std.testing.allocator, std.testing.io, std.testing.environ);
     defer cfg.deinit();
 
-    var bridge = XetBridge.init(std.testing.allocator, std.testing.io, &cfg, null);
+    var bridge = XetBridge.init(std.testing.allocator, std.testing.io, &cfg, std.testing.environ, null);
     defer bridge.deinit();
 
     try std.testing.expect(bridge.cas == null);
@@ -299,7 +303,7 @@ test "XetBridge getReconstruction requires auth" {
     var cfg = try config.Config.init(std.testing.allocator, std.testing.io, std.testing.environ);
     defer cfg.deinit();
 
-    var bridge = XetBridge.init(std.testing.allocator, std.testing.io, &cfg, null);
+    var bridge = XetBridge.init(std.testing.allocator, std.testing.io, &cfg, std.testing.environ, null);
     defer bridge.deinit();
 
     const result = bridge.getReconstruction("0" ** 64);

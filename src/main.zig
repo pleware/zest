@@ -187,7 +187,7 @@ fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wri
     }
 
     // Step 4: Initialize XET bridge (cache → P2P → CDN pipeline)
-    var bridge = xet_bridge_mod.XetBridge.init(allocator, io, &cfg, &downloader);
+    var bridge = xet_bridge_mod.XetBridge.init(allocator, io, &cfg, environ, &downloader);
     defer bridge.deinit();
 
     // Authenticate with HF to get Xet token (needed for CAS queries)

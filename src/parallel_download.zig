@@ -210,10 +210,10 @@ test "ParallelDownloader init" {
     var cfg = try config.Config.init(std.testing.allocator, std.testing.io, std.testing.environ);
     defer cfg.deinit();
 
-    var bridge = xet_bridge_mod.XetBridge.init(std.testing.allocator, std.testing.io, &cfg, null);
+    var bridge = xet_bridge_mod.XetBridge.init(std.testing.allocator, std.testing.io, &cfg, std.testing.environ, null);
     defer bridge.deinit();
 
-    var dl = ParallelDownloader.init(std.testing.allocator, std.testing.io, &bridge, 16);
+    const dl = ParallelDownloader.init(std.testing.allocator, std.testing.io, &bridge, 16);
     try std.testing.expectEqual(@as(u32, 16), dl.max_concurrent);
 }
 
@@ -221,7 +221,7 @@ test "ParallelDownloader reconstructToFile requires auth" {
     var cfg = try config.Config.init(std.testing.allocator, std.testing.io, std.testing.environ);
     defer cfg.deinit();
 
-    var bridge = xet_bridge_mod.XetBridge.init(std.testing.allocator, std.testing.io, &cfg, null);
+    var bridge = xet_bridge_mod.XetBridge.init(std.testing.allocator, std.testing.io, &cfg, std.testing.environ, null);
     defer bridge.deinit();
 
     var dl = ParallelDownloader.init(std.testing.allocator, std.testing.io, &bridge, 16);

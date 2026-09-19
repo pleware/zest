@@ -35,17 +35,14 @@ pub const Config = struct {
     pid_file_path: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, io: Io, environ: Environ) !Config {
-        const home = environ.getPosix("HOME") orelse "/root";
-        const hf_cache_env = environ.getPosix("HF_HOME");
+        const home_owned = try getEnv(environ, allocator, "HOME");
+        defer if (home_owned) |h| allocator.free(h);
+        const home = home_owned orelse "/root";
 
-        const hf_cache_dir = if (hf_cache_env) |env|
-            try allocator.dupe(u8, env)
-        else
+        const hf_cache_dir = (try getEnv(environ, allocator, "HF_HOME")) orelse
             try std.fmt.allocPrint(allocator, "{s}/.cache/huggingface/hub", .{home});
 
-        const cache_dir = if (environ.getPosix("ZEST_CACHE_DIR")) |env|
-            try allocator.dupe(u8, env)
-        else
+        const cache_dir = (try getEnv(environ, allocator, "ZEST_CACHE_DIR")) orelse
             try std.fmt.allocPrint(allocator, "{s}/.cache/zest", .{home});
 
         const xorb_cache_dir = try std.fmt.allocPrint(allocator, "{s}/xorbs", .{cache_dir});
@@ -55,12 +52,16 @@ pub const Config = struct {
         const hf_token = try readHfToken(allocator, io, environ, home);
 
         // Parse optional env var overrides
-        const http_port = if (environ.getPosix("ZEST_HTTP_PORT")) |p|
+        const http_port_str = try getEnv(environ, allocator, "ZEST_HTTP_PORT");
+        defer if (http_port_str) |p| allocator.free(p);
+        const http_port = if (http_port_str) |p|
             std.fmt.parseInt(u16, p, 10) catch default_http_port
         else
             default_http_port;
 
-        const max_peers = if (environ.getPosix("ZEST_MAX_PEERS")) |p|
+        const max_peers_str = try getEnv(environ, allocator, "ZEST_MAX_PEERS");
+        defer if (max_peers_str) |p| allocator.free(p);
+        const max_peers = if (max_peers_str) |p|
             std.fmt.parseInt(u16, p, 10) catch default_max_peers
         else
             default_max_peers;
@@ -133,10 +134,20 @@ pub const Config = struct {
     }
 };
 
+/// Cross-platform env lookup. `getPosix` is POSIX-only — on Windows the environ
+/// is a WTF-16 block — so read through `getAlloc`, returning an owned value (or
+/// null when the variable is unset).
+fn getEnv(environ: Environ, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
+    return environ.getAlloc(allocator, key) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => null,
+        else => |e| e,
+    };
+}
+
 fn readHfToken(allocator: std.mem.Allocator, io: Io, environ: Environ, home: []const u8) !?[]const u8 {
     // Try HF_TOKEN env var first
-    if (environ.getPosix("HF_TOKEN")) |env| {
-        return try allocator.dupe(u8, env);
+    if (try getEnv(environ, allocator, "HF_TOKEN")) |env| {
+        return env;
     }
 
     // Try reading from ~/.cache/huggingface/token
