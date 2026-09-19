@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .xet = .{
-            .url = "https://github.com/pleware/zig-xet/archive/e3fb3d5ba46aecc1a8548230d3cb4843c8b7ca66.tar.gz",
-            .hash = "xet-0.2.5-d6TQaqWAAwDYicanKfPH6CXNQh-why32CrxHabbmjN_V",
+            .url = "https://github.com/pleware/zig-xet/archive/42a21fee1596dacd5f28c4e7f91977beb6e4e5c4.tar.gz",
+            .hash = "xet-0.2.5-d6TQaqWAAwDtiw2V7I9Gt7hRP8sCz4Eu8fQ_ZFizyiIi",
         },
     },
     .paths = .{
