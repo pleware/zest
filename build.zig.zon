@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .xet = .{
-            .url = "https://github.com/jedisct1/zig-xet/archive/refs/heads/main.tar.gz",
-            .hash = "xet-0.1.0-d6TQaooXAwAQHBVsrWAQPNFzJO-xiCla5Ca6a_ibqLvc",
+            .url = "https://github.com/jedisct1/zig-xet/archive/035ae6c33f35d105535c2fd1bd26c6866dfa1720.tar.gz",
+            .hash = "xet-0.2.5-d6TQakGAAwDcbA0VAQpCFePu8J8RmDchmz3RIhbDauib",
         },
     },
     .paths = .{
