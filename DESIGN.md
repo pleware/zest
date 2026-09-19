@@ -743,4 +743,4 @@ The user-facing integration layer:
 
 ## License
 
-MIT
+Apache-2.0

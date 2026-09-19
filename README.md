@@ -7,6 +7,11 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Lines of Code](https://img.shields.io/badge/lines-5%2C644-informational)](#project-structure)
 
+> **Fork of [praveer13/zest](https://github.com/praveer13/zest)** (Apache-2.0).
+> This is pleware's box-side P2P model-distribution daemon for PWare OS /
+> initagent — private swarm, manifest-pinned digests, a pull task manager with
+> REST + SSE, resumable downloads, per-file GGUF selection. See [NOTICE](NOTICE).
+
 zest speaks HuggingFace's [Xet protocol](https://huggingface.co/docs/xet/index) (via [zig-xet](https://github.com/jedisct1/zig-xet)) for content addressing and [BitTorrent](https://www.bittorrent.org/beps/bep_0003.html) (BEP 3 / BEP 10 / [BEP XET](https://ccbittorrent.readthedocs.io/en/latest/bep_xet/)) for peer-to-peer transfer. Models download from nearby peers first, fall back to HF's CDN.
 
 ```bash

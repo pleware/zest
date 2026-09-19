@@ -1,0 +1,15 @@
+zest — P2P model-distribution daemon
+=====================================
+
+This product is a derivative of:
+
+  zest — https://github.com/praveer13/zest
+  Copyright 2025 zest contributors
+  Licensed under the Apache License, Version 2.0
+
+Modified by pleware (https://github.com/pleware/zest) into the box-side P2P
+model-distribution daemon for PWare OS / initagent. The modifications add:
+private swarm mode, manifest-pinned digest validation, a pull task manager with
+a REST + SSE surface, resumable downloads, and per-file (GGUF) selection.
+
+The full Apache-2.0 text is in the LICENSE file.
