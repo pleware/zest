@@ -150,6 +150,7 @@ fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wri
         direct_peers.items,
         stdout,
         stderr,
+        null, // state — the CLI pulls synchronously, no progress tracking
     ) catch |err| {
         try stderr.print("Pull failed: {}\n", .{err});
         return err;

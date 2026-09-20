@@ -12,6 +12,7 @@ const bt_peer_mod = @import("bt_peer.zig");
 const xet_bridge_mod = @import("xet_bridge.zig");
 const parallel_dl = @import("parallel_download.zig");
 const ready_mod = @import("ready.zig");
+const pull_state = @import("pull_state.zig");
 
 pub const PullResult = struct {
     snapshot_dir: []u8, // owned by the caller — the HF cache snapshot dir
@@ -30,7 +31,9 @@ pub const PullRequest = struct {
 
 /// Download a model repo into the HF cache and return the snapshot dir.
 /// Progress goes to `stdout`, warnings/errors to `stderr` (the CLI passes the
-/// real streams; the HTTP handler can pass discard/buffer writers).
+/// real streams; the HTTP handler can pass discard/buffer writers). `state`,
+/// when non-null, receives byte progress and honours its cancel flag — it lets
+/// the async HTTP pull (POST /v1/pull) report progress and be cancelled.
 pub fn pullModel(
     allocator: std.mem.Allocator,
     io: Io,
@@ -45,6 +48,7 @@ pub fn pullModel(
     direct_peers: []const []const u8,
     stdout: *Io.Writer,
     stderr: *Io.Writer,
+    state: ?*pull_state.PullState,
 ) !PullResult {
     // Step 1: List files from HF Hub via zig-xet
     var file_list = xet.model_download.listFiles(
@@ -130,9 +134,9 @@ pub fn pullModel(
             try stdout.flush();
 
             if (bridge.cas != null) {
-                par_dl.reconstructToFile(xet_hash_hex, output_path) catch |err| {
+                par_dl.reconstructToFile(xet_hash_hex, output_path, state) catch |err| {
                     try stderr.print("  Parallel download error ({}), falling back to sequential\n", .{err});
-                    bridge.reconstructToFile(xet_hash_hex, output_path) catch |err2| {
+                    bridge.reconstructToFile(xet_hash_hex, output_path, state) catch |err2| {
                         try stderr.print("  Bridge error ({}), falling back to direct download\n", .{err2});
                         try ensureParentDirs(io, output_path);
                         const dl_config = xet.model_download.DownloadConfig{
@@ -175,7 +179,7 @@ pub fn pullModel(
         } else {
             try stdout.print(" [regular]\n", .{});
             try stdout.flush();
-            downloadRegularFile(allocator, io, repo_id, revision, file.path, output_path) catch |err| {
+            downloadRegularFile(allocator, io, repo_id, revision, file.path, output_path, state) catch |err| {
                 try stderr.print("  Error downloading: {}\n", .{err});
                 continue;
             };
@@ -289,6 +293,7 @@ fn downloadRegularFile(
     revision: []const u8,
     file_path: []const u8,
     output_path: []const u8,
+    state: ?*pull_state.PullState,
 ) !void {
     const url = try std.fmt.allocPrint(
         allocator,
@@ -314,6 +319,7 @@ fn downloadRegularFile(
 
     try ensureParentDirs(io, output_path);
     try storage.writeFileAtomicAlloc(allocator, io, output_path, aw.written());
+    if (state) |s| s.addBytes(aw.written().len);
 }
 
 /// Compute the BLAKE3 hex digest of a file (streamed — no full read into memory).

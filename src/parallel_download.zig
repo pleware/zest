@@ -10,6 +10,7 @@ const xet = @import("xet");
 const config = @import("config.zig");
 const storage = @import("storage.zig");
 const xet_bridge_mod = @import("xet_bridge.zig");
+const pull_state = @import("pull_state.zig");
 
 const cas_client = xet.cas_client;
 const xorb_mod = xet.xorb;
@@ -87,11 +88,13 @@ pub const ParallelDownloader = struct {
         };
     }
 
-    /// Reconstruct a file with parallel xorb fetching.
+    /// Reconstruct a file with parallel xorb fetching. `state`, when non-null,
+    /// receives byte progress and honours its cancel flag (draft 62 progress).
     pub fn reconstructToFile(
         self: *ParallelDownloader,
         file_hash_hex: []const u8,
         output_path: []const u8,
+        state: ?*pull_state.PullState,
     ) !void {
         // Ensure parent directory exists
         if (std.mem.lastIndexOfScalar(u8, output_path, '/')) |sep| {
@@ -108,6 +111,16 @@ pub const ParallelDownloader = struct {
 
         if (recon.terms.len == 0) return;
 
+        // The file's total size is the highest term end offset (terms are
+        // sorted; their ranges are file-relative byte offsets).
+        if (state) |s| {
+            var file_size: u64 = 0;
+            for (recon.terms) |term| {
+                if (@as(u64, term.range.end) > file_size) file_size = term.range.end;
+            }
+            _ = s.bytes_total.fetchAdd(file_size, .monotonic);
+        }
+
         // Open the part file
         const file = try Io.Dir.createFileAbsolute(self.io, part_path, .{});
         var closed = false;
@@ -122,6 +135,9 @@ pub const ParallelDownloader = struct {
         const batch_cap = @min(recon.terms.len, @as(usize, self.max_concurrent) * 8);
         var batch_start: usize = 0;
         while (batch_start < recon.terms.len) {
+            if (state) |s| {
+                if (s.isCancelled()) return error.Cancelled;
+            }
             const batch_end = @min(batch_start + batch_cap, recon.terms.len);
             const batch_size = batch_end - batch_start;
 
@@ -130,6 +146,7 @@ pub const ParallelDownloader = struct {
                 recon.fetch_info,
                 batch_size,
                 &fw.interface,
+                state,
             );
 
             batch_start = batch_end;
@@ -147,6 +164,7 @@ pub const ParallelDownloader = struct {
         fetch_info_map: std.StringHashMap([]cas_client.FetchInfo),
         batch_size: usize,
         writer: *Io.Writer,
+        state: ?*pull_state.PullState,
     ) !void {
         // Allocate results and contexts
         const results = try self.allocator.alloc(?TermResult, batch_size);
@@ -205,6 +223,10 @@ pub const ParallelDownloader = struct {
             if (opt.*) |*r| {
                 defer r.deinit();
                 writer.writeAll(r.data) catch return error.WriteFailed;
+                if (state) |s| {
+                    s.addBytes(r.data.len);
+                    if (s.isCancelled()) return error.Cancelled;
+                }
             } else {
                 return error.MissingResult;
             }
@@ -233,6 +255,6 @@ test "ParallelDownloader reconstructToFile requires auth" {
     defer bridge.deinit();
 
     var dl = ParallelDownloader.init(std.testing.allocator, std.testing.io, &bridge, 16);
-    const result = dl.reconstructToFile("0" ** 64, "/tmp/test-output");
+    const result = dl.reconstructToFile("0" ** 64, "/tmp/test-output", null);
     try std.testing.expectError(error.NotAuthenticated, result);
 }

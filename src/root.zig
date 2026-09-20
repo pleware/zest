@@ -31,6 +31,7 @@ pub const xet_bridge = @import("xet_bridge.zig");
 pub const parallel_download = @import("parallel_download.zig");
 pub const pull = @import("pull.zig");
 pub const ready = @import("ready.zig");
+pub const pull_state = @import("pull_state.zig");
 
 test {
     // Run tests from all modules

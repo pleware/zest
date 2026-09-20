@@ -11,6 +11,7 @@ const xet = @import("xet");
 const config = @import("config.zig");
 const storage = @import("storage.zig");
 const swarm_mod = @import("swarm.zig");
+const pull_state = @import("pull_state.zig");
 
 // zig-xet modules
 const cas_client = xet.cas_client;
@@ -232,10 +233,13 @@ pub const XetBridge = struct {
     }
 
     /// Reconstruct a file from its xet hash and write to output path.
+    /// `state`, when non-null, receives byte progress and honours cancel
+    /// (draft 62 progress).
     pub fn reconstructToFile(
         self: *XetBridge,
         file_hash_hex: []const u8,
         output_path: []const u8,
+        state: ?*pull_state.PullState,
     ) !void {
         // Ensure parent directory exists
         if (std.mem.lastIndexOfScalar(u8, output_path, '/')) |sep| {
@@ -252,6 +256,14 @@ pub const XetBridge = struct {
         var recon = try self.getReconstruction(file_hash_hex);
         defer recon.deinit();
 
+        if (state) |s| {
+            var file_size: u64 = 0;
+            for (recon.terms) |term| {
+                if (@as(u64, term.range.end) > file_size) file_size = term.range.end;
+            }
+            _ = s.bytes_total.fetchAdd(file_size, .monotonic);
+        }
+
         // Open the part file
         const file = try Io.Dir.createFileAbsolute(self.io, part_path, .{});
         var closed = false;
@@ -261,6 +273,9 @@ pub const XetBridge = struct {
 
         // Process each term: fetch xorb → extract chunks → write
         for (recon.terms) |term| {
+            if (state) |s| {
+                if (s.isCancelled()) return error.Cancelled;
+            }
             const result = try self.fetchXorbForTerm(term, recon.fetch_info);
             defer self.allocator.free(result.data);
 
@@ -269,6 +284,7 @@ pub const XetBridge = struct {
             defer self.allocator.free(chunk_data);
 
             fw.interface.writeAll(chunk_data) catch return error.WriteFailed;
+            if (state) |s| s.addBytes(chunk_data.len);
         }
 
         fw.interface.flush() catch return error.WriteFailed;

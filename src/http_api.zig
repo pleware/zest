@@ -16,6 +16,7 @@ const server_mod = @import("server.zig");
 const swarm = @import("swarm.zig");
 const pull_mod = @import("pull.zig");
 const ready_mod = @import("ready.zig");
+const pull_state = @import("pull_state.zig");
 
 pub const HttpApi = struct {
     allocator: std.mem.Allocator,
@@ -27,6 +28,7 @@ pub const HttpApi = struct {
     shutdown_flag: *std.atomic.Value(bool),
     requests_served: std.atomic.Value(u64),
     xorbs_cached: u64,
+    registry: pull_state.Registry,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -46,6 +48,7 @@ pub const HttpApi = struct {
             .shutdown_flag = shutdown_flag,
             .requests_served = std.atomic.Value(u64).init(0),
             .xorbs_cached = 0,
+            .registry = pull_state.Registry.init(allocator, io),
         };
     }
 
@@ -107,7 +110,9 @@ pub const HttpApi = struct {
             try self.handleStatus(http_server, request);
         } else if (std.mem.eql(u8, target, "/v1/stop")) {
             try self.handleStop(http_server, request);
-        } else if (std.mem.startsWith(u8, target, "/v1/pull")) {
+        } else if (std.mem.startsWith(u8, target, "/v1/pull/")) {
+            try self.handlePullSub(http_server, request);
+        } else if (std.mem.eql(u8, target, "/v1/pull")) {
             if (request.head.method == .GET) {
                 try self.handlePullList(http_server, request);
             } else {
@@ -161,41 +166,78 @@ pub const HttpApi = struct {
         const pr = parsed.value;
         const revision = pr.revision orelse config.default_revision;
 
-        // Capture progress in buffers (SSE streaming is a later step)
-        var out_writer: Io.Writer.Allocating = .init(self.allocator);
-        defer out_writer.deinit();
-        var err_writer: Io.Writer.Allocating = .init(self.allocator);
-        defer err_writer.deinit();
-
-        const result = pull_mod.pullModel(
-            self.allocator,
-            self.io,
-            self.environ,
-            self.cfg,
-            pr.repo,
-            revision,
-            pr.file,
-            pr.digest,
-            null, // tracker
-            true, // p2p
-            &.{}, // direct peers
-            &out_writer.writer,
-            &err_writer.writer,
-        ) catch |err| {
-            var msg_buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&msg_buf, "{{\"error\":\"pull failed: {}\"}}", .{err}) catch "{\"error\":\"pull failed\"}";
-            try self.sendJson(http_server, request, .internal_server_error, msg);
+        // Register the pull, then run it in a background thread. The caller
+        // polls GET /v1/pull/{id}/progress and cancels with POST /v1/pull/{id}/cancel.
+        const ps = self.registry.start(pr.repo, revision, pr.file) catch {
+            try self.sendJson(http_server, request, .internal_server_error, "{\"error\":\"failed to register pull\"}");
             return;
         };
-        defer self.allocator.free(result.snapshot_dir);
 
-        var resp_buf: [1024]u8 = undefined;
-        const resp = std.fmt.bufPrint(
-            &resp_buf,
-            "{{\"status\":\"ready\",\"snapshot_dir\":\"{s}\",\"files\":{d}}}",
-            .{ result.snapshot_dir, result.files_downloaded },
-        ) catch "{\"status\":\"ready\"}";
-        try self.sendJson(http_server, request, .ok, resp);
+        const args = buildPullArgs(self, ps, pr.repo, revision, pr.file, pr.digest) catch {
+            ps.finish(self.allocator, .failed, null, "allocation failed");
+            try self.sendJson(http_server, request, .internal_server_error, "{\"error\":\"allocation failed\"}");
+            return;
+        };
+
+        const thread = std.Thread.spawn(.{}, pullThreadMain, .{args}) catch {
+            freePullArgs(self.allocator, args);
+            ps.finish(self.allocator, .failed, null, "thread spawn failed");
+            try self.sendJson(http_server, request, .internal_server_error, "{\"error\":\"thread spawn failed\"}");
+            return;
+        };
+        thread.detach();
+
+        var resp_buf: [256]u8 = undefined;
+        const resp = std.fmt.bufPrint(&resp_buf, "{{\"id\":\"{s}\",\"status\":\"started\"}}", .{ps.id}) catch
+            "{\"status\":\"started\"}";
+        try self.sendJson(http_server, request, .accepted, resp);
+    }
+
+    /// Route a /v1/pull/{id}/… path to progress or cancel.
+    fn handlePullSub(self: *HttpApi, http_server: *std.http.Server, request: std.http.Server.Request) !void {
+        const target = request.head.target;
+        const rest = target["/v1/pull/".len..];
+        if (std.mem.endsWith(u8, rest, "/progress")) {
+            try self.handlePullProgress(http_server, request, rest[0 .. rest.len - "/progress".len]);
+        } else if (std.mem.endsWith(u8, rest, "/cancel")) {
+            try self.handlePullCancel(http_server, request, rest[0 .. rest.len - "/cancel".len]);
+        } else {
+            try self.sendJson(http_server, request, .not_found, "{\"error\":\"not found\"}");
+        }
+    }
+
+    /// GET /v1/pull/{id}/progress — the pull's byte progress + lifecycle state.
+    fn handlePullProgress(self: *HttpApi, http_server: *std.http.Server, request: std.http.Server.Request, id: []const u8) !void {
+        const ps = self.registry.get(id) orelse {
+            try self.sendJson(http_server, request, .not_found, "{\"error\":\"unknown pull id\"}");
+            return;
+        };
+        const st = ps.getState();
+        const st_str = switch (st) {
+            .running => "running",
+            .done => "done",
+            .failed => "failed",
+            .cancelled => "cancelled",
+        };
+        const snap = if (st == .done) (ps.snapshot_dir orelse "") else "";
+        const err_msg = ps.error_msg orelse "";
+        var buf: [640]u8 = undefined;
+        const json = std.fmt.bufPrint(&buf, "{{\"id\":\"{s}\",\"state\":\"{s}\",\"bytes_done\":{d},\"bytes_total\":{d},\"snapshot_dir\":\"{s}\",\"error\":\"{s}\"}}", .{ ps.id, st_str, ps.bytes_done.load(.acquire), ps.bytes_total.load(.acquire), snap, err_msg }) catch
+            "{\"error\":\"serialize failed\"}";
+        try self.sendJson(http_server, request, .ok, json);
+    }
+
+    /// POST /v1/pull/{id}/cancel — set the pull's cancel flag (idempotent).
+    fn handlePullCancel(self: *HttpApi, http_server: *std.http.Server, request: std.http.Server.Request, id: []const u8) !void {
+        const ps = self.registry.get(id) orelse {
+            try self.sendJson(http_server, request, .not_found, "{\"error\":\"unknown pull id\"}");
+            return;
+        };
+        ps.requestCancel();
+        var buf: [128]u8 = undefined;
+        const json = std.fmt.bufPrint(&buf, "{{\"id\":\"{s}\",\"status\":\"cancelling\"}}", .{ps.id}) catch
+            "{\"id\":\"?\",\"status\":\"cancelling\"}";
+        try self.sendJson(http_server, request, .ok, json);
     }
 
     fn handleStop(self: *HttpApi, http_server: *std.http.Server, request: std.http.Server.Request) !void {
@@ -306,6 +348,103 @@ pub const HttpApi = struct {
         });
     }
 };
+
+/// Arguments for a background pull thread. The thread owns and frees these
+/// (see freePullArgs) when it finishes.
+const PullThreadArgs = struct {
+    allocator: std.mem.Allocator,
+    io: Io,
+    environ: std.process.Environ,
+    cfg: *const config.Config,
+    state: *pull_state.PullState,
+    repo: []u8,
+    revision: []u8,
+    file: ?[]u8,
+    digest: ?[]u8,
+};
+
+/// Allocate the thread args, duplicating the strings the thread owns. On
+/// success the returned args are fully-owned; on failure the already-duplicated
+/// strings are freed via errdefer.
+fn buildPullArgs(
+    api: *HttpApi,
+    state: *pull_state.PullState,
+    repo: []const u8,
+    revision: []const u8,
+    file: ?[]const u8,
+    digest: ?[]const u8,
+) !*PullThreadArgs {
+    const repo_dup = try api.allocator.dupe(u8, repo);
+    errdefer api.allocator.free(repo_dup);
+    const rev_dup = try api.allocator.dupe(u8, revision);
+    errdefer api.allocator.free(rev_dup);
+    const file_dup: ?[]u8 = if (file) |f| try api.allocator.dupe(u8, f) else null;
+    errdefer if (file_dup) |f| api.allocator.free(f);
+    const digest_dup: ?[]u8 = if (digest) |d| try api.allocator.dupe(u8, d) else null;
+    errdefer if (digest_dup) |d| api.allocator.free(d);
+
+    const args = try api.allocator.create(PullThreadArgs);
+    args.* = .{
+        .allocator = api.allocator,
+        .io = api.io,
+        .environ = api.environ,
+        .cfg = api.cfg,
+        .state = state,
+        .repo = repo_dup,
+        .revision = rev_dup,
+        .file = file_dup,
+        .digest = digest_dup,
+    };
+    return args;
+}
+
+fn freePullArgs(allocator: std.mem.Allocator, args: *PullThreadArgs) void {
+    allocator.free(args.repo);
+    allocator.free(args.revision);
+    if (args.file) |f| allocator.free(f);
+    if (args.digest) |d| allocator.free(d);
+    allocator.destroy(args);
+}
+
+/// Background pull thread: runs the pull, then records the terminal state and
+/// frees its arguments.
+fn pullThreadMain(args: *PullThreadArgs) void {
+    var out_writer: Io.Writer.Allocating = .init(args.allocator);
+    defer out_writer.deinit();
+    var err_writer: Io.Writer.Allocating = .init(args.allocator);
+    defer err_writer.deinit();
+
+    const result = pull_mod.pullModel(
+        args.allocator,
+        args.io,
+        args.environ,
+        args.cfg,
+        args.repo,
+        args.revision,
+        args.file,
+        args.digest,
+        null, // tracker
+        true, // p2p
+        &.{}, // direct peers
+        &out_writer.writer,
+        &err_writer.writer,
+        args.state,
+    ) catch |err| {
+        if (args.state.isCancelled()) {
+            args.state.finish(args.allocator, .cancelled, null, "cancelled");
+        } else {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "{}", .{err}) catch "pull failed";
+            args.state.finish(args.allocator, .failed, null, msg);
+        }
+        freePullArgs(args.allocator, args);
+        return;
+    };
+
+    args.state.finish(args.allocator, .done, result.snapshot_dir, null);
+    args.allocator.free(result.snapshot_dir);
+    freePullArgs(args.allocator, args);
+}
 
 const dashboard_html =
     \\<!DOCTYPE html>
