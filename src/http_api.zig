@@ -190,7 +190,8 @@ pub const HttpApi = struct {
         defer self.allocator.free(result.snapshot_dir);
 
         var resp_buf: [1024]u8 = undefined;
-        const resp = std.fmt.bufPrint(&resp_buf,
+        const resp = std.fmt.bufPrint(
+            &resp_buf,
             "{{\"status\":\"ready\",\"snapshot_dir\":\"{s}\",\"files\":{d}}}",
             .{ result.snapshot_dir, result.files_downloaded },
         ) catch "{\"status\":\"ready\"}";
