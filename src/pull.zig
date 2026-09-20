@@ -11,6 +11,7 @@ const storage = @import("storage.zig");
 const bt_peer_mod = @import("bt_peer.zig");
 const xet_bridge_mod = @import("xet_bridge.zig");
 const parallel_dl = @import("parallel_download.zig");
+const ready_mod = @import("ready.zig");
 
 pub const PullResult = struct {
     snapshot_dir: []u8, // owned by the caller — the HF cache snapshot dir
@@ -194,6 +195,7 @@ pub fn pullModel(
                 return error.DigestMismatch;
             }
             try stdout.print("digest verified: {s}\n", .{digest_hex});
+            try ready_mod.markReady(allocator, io, cfg, repo_id, commit, file_name, digest_hex);
         }
     }
 

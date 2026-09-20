@@ -15,6 +15,7 @@ const storage = @import("storage.zig");
 const server_mod = @import("server.zig");
 const swarm = @import("swarm.zig");
 const pull_mod = @import("pull.zig");
+const ready_mod = @import("ready.zig");
 
 pub const HttpApi = struct {
     allocator: std.mem.Allocator,
@@ -107,7 +108,11 @@ pub const HttpApi = struct {
         } else if (std.mem.eql(u8, target, "/v1/stop")) {
             try self.handleStop(http_server, request);
         } else if (std.mem.startsWith(u8, target, "/v1/pull")) {
-            try self.handlePull(http_server, request);
+            if (request.head.method == .GET) {
+                try self.handlePullList(http_server, request);
+            } else {
+                try self.handlePull(http_server, request);
+            }
         } else if (std.mem.eql(u8, target, "/v1/models")) {
             try self.handleModels(http_server, request);
         } else if (std.mem.eql(u8, target, "/") or std.mem.eql(u8, target, "/ui")) {
@@ -197,6 +202,24 @@ pub const HttpApi = struct {
         self.shutdown_flag.store(true, .release);
         // Shut down the BT server too
         if (self.bt_server) |bs| bs.shutdown();
+    }
+
+    /// List the ready models — GET /v1/pull returns the registry of downloaded
+    /// + verified models (draft 62), which `fleet sync` reads to filter the
+    /// roster to only ready models.
+    fn handlePullList(self: *HttpApi, http_server: *std.http.Server, request: std.http.Server.Request) !void {
+        var parsed = ready_mod.list(self.allocator, self.io, self.cfg) catch {
+            try self.sendJson(http_server, request, .internal_server_error, "{\"error\":\"failed to read ready registry\"}");
+            return;
+        };
+        defer parsed.deinit();
+
+        const json = std.json.Stringify.valueAlloc(self.allocator, parsed.value, .{}) catch {
+            try self.sendJson(http_server, request, .internal_server_error, "{\"error\":\"failed to serialize registry\"}");
+            return;
+        };
+        defer self.allocator.free(json);
+        try self.sendJson(http_server, request, .ok, json);
     }
 
     /// Scan HF cache for downloaded models and return as JSON array.

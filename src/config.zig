@@ -33,6 +33,7 @@ pub const Config = struct {
     max_peers: u16,
     chunk_target_size: u32,
     pid_file_path: []const u8,
+    ready_path: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, io: Io, environ: Environ) !Config {
         const home_owned = try getEnv(environ, allocator, "HOME");
@@ -48,6 +49,7 @@ pub const Config = struct {
         const xorb_cache_dir = try std.fmt.allocPrint(allocator, "{s}/xorbs", .{cache_dir});
         const chunk_cache_dir = try std.fmt.allocPrint(allocator, "{s}/chunks", .{cache_dir});
         const pid_file_path = try std.fmt.allocPrint(allocator, "{s}/zest.pid", .{cache_dir});
+        const ready_path = try std.fmt.allocPrint(allocator, "{s}/ready.json", .{cache_dir});
 
         const hf_token = try readHfToken(allocator, io, environ, home);
 
@@ -81,12 +83,14 @@ pub const Config = struct {
             .max_peers = max_peers,
             .chunk_target_size = default_chunk_target_size,
             .pid_file_path = pid_file_path,
+            .ready_path = ready_path,
         };
     }
 
     pub fn deinit(self: *Config) void {
         if (self.hf_token) |token| self.allocator.free(token);
         self.allocator.free(self.pid_file_path);
+        self.allocator.free(self.ready_path);
         self.allocator.free(self.xorb_cache_dir);
         self.allocator.free(self.chunk_cache_dir);
         self.allocator.free(self.cache_dir);
