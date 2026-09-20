@@ -313,7 +313,7 @@ fn downloadRegularFile(
     }
 
     try ensureParentDirs(io, output_path);
-    try storage.writeFileAtomic(io, output_path, aw.written());
+    try storage.writeFileAtomicAlloc(allocator, io, output_path, aw.written());
 }
 
 /// Compute the BLAKE3 hex digest of a file (streamed — no full read into memory).

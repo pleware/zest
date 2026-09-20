@@ -40,6 +40,29 @@ pub fn writeFileAtomic(io: Io, path: []const u8, data: []const u8) !void {
     fw.interface.flush() catch return error.WriteFailed;
 }
 
+/// Write `data` to `path` atomically: write a sibling `.part` file and rename
+/// it into place on success, so the target only ever holds a complete write. An
+/// interrupted write leaves `.part`, never a half-written target (draft 62 —
+/// resume: the re-run re-uses the xorb cache and re-writes from `.part`).
+pub fn writeFileAtomicAlloc(allocator: std.mem.Allocator, io: Io, path: []const u8, data: []const u8) !void {
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| {
+        try ensureDirRecursive(io, path[0..sep]);
+    }
+    const part_path = try std.fmt.allocPrint(allocator, "{s}.part", .{path});
+    defer allocator.free(part_path);
+
+    const file = try Io.Dir.createFileAbsolute(io, part_path, .{});
+    var closed = false;
+    defer if (!closed) file.close(io);
+    var buf: [4096]u8 = undefined;
+    var fw = file.writer(io, &buf);
+    fw.interface.writeAll(data) catch return error.WriteFailed;
+    fw.interface.flush() catch return error.WriteFailed;
+    file.close(io);
+    closed = true;
+    try Io.Dir.renameAbsolute(part_path, path, io);
+}
+
 /// Pre-allocate a file to a given size (hint for the filesystem).
 pub fn preallocateFile(io: Io, path: []const u8, size: u64) !Io.File {
     _ = size;
@@ -225,4 +248,20 @@ pub fn listCachedXorbs(allocator: std.mem.Allocator, cfg: *const config.Config) 
     }
 
     return try hashes.toOwnedSlice(allocator);
+}
+
+test "writeFileAtomicAlloc renames the .part into place" {
+    const path = "/tmp/zest_atomic_test.bin";
+    Io.Dir.deleteFileAbsolute(std.testing.io, path) catch {};
+
+    try writeFileAtomicAlloc(std.testing.allocator, std.testing.io, path, "hello atomic");
+
+    const file = try Io.Dir.openFileAbsolute(std.testing.io, path, .{});
+    defer file.close(std.testing.io);
+    var buf: [64]u8 = undefined;
+    var reader = file.reader(std.testing.io, &.{});
+    const n = try reader.interface.readSliceShort(&buf);
+    try std.testing.expectEqualStrings("hello atomic", buf[0..n]);
+
+    Io.Dir.deleteFileAbsolute(std.testing.io, path) catch {};
 }

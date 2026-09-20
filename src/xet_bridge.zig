@@ -242,13 +242,20 @@ pub const XetBridge = struct {
             try storage.ensureDirRecursive(self.io, output_path[0..sep]);
         }
 
+        // Download into a `.part` sibling and rename on success, so an
+        // interrupted download leaves `.part`, never a half-written file at the
+        // final path (draft 62 — resume re-serves the xorb cache).
+        const part_path = try std.fmt.allocPrint(self.allocator, "{s}.part", .{output_path});
+        defer self.allocator.free(part_path);
+
         // Get reconstruction info from CAS
         var recon = try self.getReconstruction(file_hash_hex);
         defer recon.deinit();
 
-        // Open output file
-        const file = try Io.Dir.createFileAbsolute(self.io, output_path, .{});
-        defer file.close(self.io);
+        // Open the part file
+        const file = try Io.Dir.createFileAbsolute(self.io, part_path, .{});
+        var closed = false;
+        defer if (!closed) file.close(self.io);
         var file_buf: [8192]u8 = undefined;
         var fw = file.writer(self.io, &file_buf);
 
@@ -265,6 +272,9 @@ pub const XetBridge = struct {
         }
 
         fw.interface.flush() catch return error.WriteFailed;
+        file.close(self.io);
+        closed = true;
+        try Io.Dir.renameAbsolute(part_path, output_path, self.io);
     }
 
     /// Print fetch stats to a writer.

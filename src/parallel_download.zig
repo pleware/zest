@@ -98,15 +98,20 @@ pub const ParallelDownloader = struct {
             try storage.ensureDirRecursive(self.io, output_path[0..sep]);
         }
 
+        // Download into a `.part` sibling and rename on success (draft 62 resume).
+        const part_path = try std.fmt.allocPrint(self.allocator, "{s}.part", .{output_path});
+        defer self.allocator.free(part_path);
+
         // Get reconstruction info from CAS
         var recon = try self.bridge.getReconstruction(file_hash_hex);
         defer recon.deinit();
 
         if (recon.terms.len == 0) return;
 
-        // Open output file
-        const file = try Io.Dir.createFileAbsolute(self.io, output_path, .{});
-        defer file.close(self.io);
+        // Open the part file
+        const file = try Io.Dir.createFileAbsolute(self.io, part_path, .{});
+        var closed = false;
+        defer if (!closed) file.close(self.io);
         var file_buf: [8192]u8 = undefined;
         var fw = file.writer(self.io, &file_buf);
 
@@ -131,6 +136,9 @@ pub const ParallelDownloader = struct {
         }
 
         fw.interface.flush() catch return error.WriteFailed;
+        file.close(self.io);
+        closed = true;
+        try Io.Dir.renameAbsolute(part_path, output_path, self.io);
     }
 
     fn processBatch(
