@@ -27,6 +27,7 @@ const server_mod = @import("server.zig");
 const http_api_mod = @import("http_api.zig");
 const xet_bridge_mod = @import("xet_bridge.zig");
 const parallel_dl = @import("parallel_download.zig");
+const pull_mod = @import("pull.zig");
 
 const version = "0.4.2";
 
@@ -135,172 +136,33 @@ fn cmdPull(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wri
         try stdout.print("P2P disabled (CDN only)\n", .{});
     }
 
-    // Step 1: List files from HF Hub via zig-xet
-    try stdout.print("Fetching model info from HuggingFace Hub...\n", .{});
-    try stdout.flush();
-
-    var file_list = xet.model_download.listFiles(
+    const result = pull_mod.pullModel(
         allocator,
         io,
         environ,
+        &cfg,
         repo_id,
-        "model",
         revision,
-        cfg.hf_token,
+        null, // include_file — the CLI pulls the whole repo
+        null, // expected_digest
+        tracker_url,
+        enable_p2p,
+        direct_peers.items,
+        stdout,
+        stderr,
     ) catch |err| {
-        try stderr.print("Error listing files: {}\n", .{err});
+        try stderr.print("Pull failed: {}\n", .{err});
         return err;
     };
-    defer file_list.deinit();
-
-    // Resolve revision to actual commit SHA (e.g. "main" → "607a30d7...")
-    const resolved_sha = resolveCommitSha(allocator, io, repo_id, revision, cfg.hf_token);
-    defer if (resolved_sha) |s| allocator.free(s);
-    const commit: []const u8 = resolved_sha orelse revision;
-
-    if (resolved_sha != null) {
-        try stdout.print("Found {d} files (revision: {s} → {s})\n", .{ file_list.files.len, revision, commit });
-    } else {
-        try stdout.print("Found {d} files (revision: {s})\n", .{ file_list.files.len, revision });
-    }
-
-    // Step 2: Detect Xet files
-    try stdout.print("Detecting Xet-backed files...\n", .{});
-    var xet_count: usize = 0;
-    for (file_list.files) |file| {
-        if (file.xet_hash != null) xet_count += 1;
-    }
-    try stdout.print("  {d} Xet-backed files, {d} total files\n", .{ xet_count, file_list.files.len });
-
-    // Step 3: Initialize swarm downloader (BT-compliant P2P)
-    var downloader = try swarm.SwarmDownloader.init(allocator, io, &cfg, tracker_url, enable_p2p);
-    defer downloader.deinit();
-
-    // Add direct peers from --peer flags
-    for (direct_peers.items) |peer_str| {
-        const addr = bt_peer_mod.parseAddress(peer_str) catch {
-            try stderr.print("Warning: invalid peer address: {s}\n", .{peer_str});
-            continue;
-        };
-        downloader.addDirectPeer(addr) catch {};
-        try stdout.print("  Direct peer: {s}\n", .{peer_str});
-    }
-
-    // Step 4: Initialize XET bridge (cache → P2P → CDN pipeline)
-    var bridge = xet_bridge_mod.XetBridge.init(allocator, io, &cfg, environ, &downloader);
-    defer bridge.deinit();
-
-    // Authenticate with HF to get Xet token (needed for CAS queries)
-    if (xet_count > 0) {
-        if (cfg.hf_token) |hf_token| {
-            try stdout.print("Authenticating with Xet CAS...\n", .{});
-            try stdout.flush();
-            bridge.authenticate(repo_id, "model", revision, hf_token) catch |err| {
-                try stderr.print("Warning: Xet auth failed ({}), falling back to direct download\n", .{err});
-            };
-        }
-    }
-
-    // Initialize parallel downloader (uses Io.Group for concurrent xorb fetches)
-    var par_dl = parallel_dl.ParallelDownloader.init(
-        allocator,
-        io,
-        &bridge,
-        config.default_max_concurrent_downloads,
-    );
-
-    // Step 5: Download and reconstruct each file
-    var files_done: usize = 0;
-    for (file_list.files) |file| {
-        files_done += 1;
-        try stdout.print("[{d}/{d}] {s}", .{ files_done, file_list.files.len, file.path });
-
-        const output_path = try buildOutputPath(allocator, &cfg, repo_id, commit, file.path);
-        defer allocator.free(output_path);
-
-        // Check if already downloaded
-        if (Io.Dir.accessAbsolute(io, output_path, .{})) |_| {
-            try stdout.print(" (cached)\n", .{});
-            continue;
-        } else |_| {}
-
-        if (file.xet_hash) |xet_hash_hex| {
-            try stdout.print(" [xet]\n", .{});
-            try stdout.flush();
-
-            // Try parallel pipeline first: cache → CDN (16 concurrent xorb fetches)
-            if (bridge.cas != null) {
-                par_dl.reconstructToFile(xet_hash_hex, output_path) catch |err| {
-                    try stderr.print("  Parallel download error ({}), falling back to sequential\n", .{err});
-                    // Fall back to sequential bridge pipeline
-                    bridge.reconstructToFile(xet_hash_hex, output_path) catch |err2| {
-                        try stderr.print("  Bridge error ({}), falling back to direct download\n", .{err2});
-                        try ensureParentDirs(io, output_path);
-                        const dl_config = xet.model_download.DownloadConfig{
-                            .repo_id = repo_id,
-                            .revision = revision,
-                            .file_hash_hex = xet_hash_hex,
-                            .hf_token = cfg.hf_token,
-                        };
-                        xet.model_download.downloadModelToFile(
-                            allocator,
-                            io,
-                            environ,
-                            dl_config,
-                            output_path,
-                        ) catch |err3| {
-                            try stderr.print("  Error downloading via xet: {}\n", .{err3});
-                            continue;
-                        };
-                    };
-                };
-            } else {
-                // No bridge auth — use zig-xet directly (CDN only)
-                try ensureParentDirs(io, output_path);
-                const dl_config = xet.model_download.DownloadConfig{
-                    .repo_id = repo_id,
-                    .revision = revision,
-                    .file_hash_hex = xet_hash_hex,
-                    .hf_token = cfg.hf_token,
-                };
-                xet.model_download.downloadModelToFile(
-                    allocator,
-                    io,
-                    environ,
-                    dl_config,
-                    output_path,
-                ) catch |err| {
-                    try stderr.print("  Error downloading via xet: {}\n", .{err});
-                    continue;
-                };
-            }
-        } else {
-            try stdout.print(" [regular]\n", .{});
-            try stdout.flush();
-            downloadRegularFile(allocator, io, repo_id, revision, file.path, output_path) catch |err| {
-                try stderr.print("  Error downloading: {}\n", .{err});
-                continue;
-            };
-        }
-    }
-
-    // Write refs file so from_pretrained() resolves
-    storage.writeRef(allocator, &cfg, repo_id, revision, commit) catch |err| {
-        try stderr.print("Warning: failed to write ref: {}\n", .{err});
-    };
+    defer allocator.free(result.snapshot_dir);
 
     // Auto-start background server for seeding (if not already running)
     if (enable_p2p) {
         autoStartServer(allocator, io, init, &cfg, stdout);
     }
 
-    bridge.printStats(stdout);
-    downloader.printStats(stdout);
     try stdout.print("\nDone! Model available at:\n", .{});
-
-    const snapshot_dir = try cfg.modelSnapshotDir(repo_id, commit);
-    defer allocator.free(snapshot_dir);
-    try stdout.print("  {s}\n", .{snapshot_dir});
+    try stdout.print("  {s}\n", .{result.snapshot_dir});
     try stdout.print("\nRun: transformers.AutoModel.from_pretrained(\"{s}\")\n", .{repo_id});
 }
 
@@ -442,7 +304,7 @@ fn cmdServe(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wr
     var bt_server = server_mod.BtServer.init(allocator, io, &cfg);
 
     // Start HTTP API
-    var http_api = http_api_mod.HttpApi.init(allocator, io, &cfg, &bt_server, &shutdown_flag);
+    var http_api = http_api_mod.HttpApi.init(allocator, io, &cfg, environ, &bt_server, &shutdown_flag);
 
     // Run BT server concurrently with HTTP API via Io.Group
     var bt_ctx = BtServerCtx{ .server = &bt_server };
@@ -612,121 +474,6 @@ fn readPidFile(allocator: std.mem.Allocator, io: Io, path: []const u8) ?[]u8 {
     return allocator.dupe(u8, content) catch null;
 }
 
-/// Build the output path for a file in the HF cache layout.
-fn buildOutputPath(
-    allocator: std.mem.Allocator,
-    cfg: *const config.Config,
-    repo_id: []const u8,
-    commit: []const u8,
-    file_path: []const u8,
-) ![]u8 {
-    const snapshot_dir = try cfg.modelSnapshotDir(repo_id, commit);
-    defer allocator.free(snapshot_dir);
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ snapshot_dir, file_path });
-}
-
-/// Ensure all parent directories in a path exist.
-fn ensureParentDirs(io: Io, path: []const u8) !void {
-    if (std.mem.lastIndexOfScalar(u8, path, '/')) |sep| {
-        try storage.ensureDirRecursive(io, path[0..sep]);
-    }
-}
-
-/// Resolve a revision (branch name like "main") to an actual commit SHA
-/// by querying the HF API: GET /api/models/{repo}/revision/{revision}
-/// Returns the SHA string, or null if resolution fails (falls back to revision as-is).
-fn resolveCommitSha(allocator: std.mem.Allocator, io: Io, repo_id: []const u8, revision: []const u8, token: ?[]const u8) ?[]u8 {
-    const url = std.fmt.allocPrint(
-        allocator,
-        "{s}/api/models/{s}/revision/{s}",
-        .{ config.hf_hub_url, repo_id, revision },
-    ) catch return null;
-    defer allocator.free(url);
-
-    var http_client: std.http.Client = .{ .allocator = allocator, .io = io };
-    defer http_client.deinit();
-
-    var aw: Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-
-    // Build authorization header if token available
-    var auth_buf: [256]u8 = undefined;
-    const auth_header: ?[]const u8 = if (token) |t|
-        std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{t}) catch null
-    else
-        null;
-
-    const extra_headers: []const std.http.Header = if (auth_header) |auth|
-        &.{.{ .name = "authorization", .value = auth }}
-    else
-        &.{};
-
-    const result = http_client.fetch(.{
-        .location = .{ .url = url },
-        .response_writer = &aw.writer,
-        .extra_headers = extra_headers,
-    }) catch return null;
-
-    if (result.status != .ok) return null;
-
-    const body = aw.written();
-
-    // Parse JSON to extract "sha" field
-    // Response looks like: {"sha":"607a30d783dfa663caf39e06633721c8d4cfcd7e",...}
-    return extractJsonSha(allocator, body);
-}
-
-/// Extract the "sha" value from a JSON response.
-/// Looks for "sha":"<40-char hex>" pattern.
-fn extractJsonSha(allocator: std.mem.Allocator, json: []const u8) ?[]u8 {
-    // Find "sha":" pattern
-    const needle = "\"sha\":\"";
-    const pos = std.mem.indexOf(u8, json, needle) orelse return null;
-    const start = pos + needle.len;
-    if (start + 40 > json.len) return null;
-
-    const sha = json[start..][0..40];
-    // Validate it's hex
-    for (sha) |c| {
-        if (!std.ascii.isHex(c)) return null;
-    }
-    return allocator.dupe(u8, sha) catch null;
-}
-
-fn downloadRegularFile(
-    allocator: std.mem.Allocator,
-    io: Io,
-    repo_id: []const u8,
-    revision: []const u8,
-    file_path: []const u8,
-    output_path: []const u8,
-) !void {
-    const url = try std.fmt.allocPrint(
-        allocator,
-        "{s}/{s}/resolve/{s}/{s}",
-        .{ config.hf_hub_url, repo_id, revision, file_path },
-    );
-    defer allocator.free(url);
-
-    var http_client: std.http.Client = .{ .allocator = allocator, .io = io };
-    defer http_client.deinit();
-
-    var aw: Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-
-    const result = http_client.fetch(.{
-        .location = .{ .url = url },
-        .response_writer = &aw.writer,
-    }) catch return error.HttpError;
-
-    if (result.status != .ok) {
-        return error.HttpError;
-    }
-
-    try ensureParentDirs(io, output_path);
-    try storage.writeFileAtomic(io, output_path, aw.written());
-}
-
 fn printUsage(w: *Io.Writer) void {
     w.print(
         \\zest — P2P acceleration for ML model distribution (BitTorrent-compliant)
@@ -776,30 +523,4 @@ fn printUsage(w: *Io.Writer) void {
 test "arg parsing smoke test" {
     // Just verify the module compiles and basic types are accessible
     try std.testing.expect(version.len > 0);
-}
-
-test "extractJsonSha parses HF API response" {
-    const json =
-        \\{"_id":"6340","id":"gpt2","sha":"607a30d783dfa663caf39e06633721c8d4cfcd7e","other":"value"}
-    ;
-    const sha = extractJsonSha(std.testing.allocator, json);
-    defer if (sha) |s| std.testing.allocator.free(s);
-    try std.testing.expect(sha != null);
-    try std.testing.expectEqualStrings("607a30d783dfa663caf39e06633721c8d4cfcd7e", sha.?);
-}
-
-test "extractJsonSha returns null for missing sha" {
-    const json =
-        \\{"id":"gpt2","name":"GPT-2"}
-    ;
-    const sha = extractJsonSha(std.testing.allocator, json);
-    try std.testing.expect(sha == null);
-}
-
-test "extractJsonSha rejects invalid hex" {
-    const json =
-        \\{"sha":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"}
-    ;
-    const sha = extractJsonSha(std.testing.allocator, json);
-    try std.testing.expect(sha == null);
 }

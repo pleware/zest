@@ -14,11 +14,13 @@ const config = @import("config.zig");
 const storage = @import("storage.zig");
 const server_mod = @import("server.zig");
 const swarm = @import("swarm.zig");
+const pull_mod = @import("pull.zig");
 
 pub const HttpApi = struct {
     allocator: std.mem.Allocator,
     io: Io,
     cfg: *const config.Config,
+    environ: std.process.Environ,
     bt_server: ?*server_mod.BtServer,
     listener: ?net.Server,
     shutdown_flag: *std.atomic.Value(bool),
@@ -29,6 +31,7 @@ pub const HttpApi = struct {
         allocator: std.mem.Allocator,
         io: Io,
         cfg: *const config.Config,
+        environ: std.process.Environ,
         bt_server: ?*server_mod.BtServer,
         shutdown_flag: *std.atomic.Value(bool),
     ) HttpApi {
@@ -36,6 +39,7 @@ pub const HttpApi = struct {
             .allocator = allocator,
             .io = io,
             .cfg = cfg,
+            .environ = environ,
             .bt_server = bt_server,
             .listener = null,
             .shutdown_flag = shutdown_flag,
@@ -136,9 +140,56 @@ pub const HttpApi = struct {
     }
 
     fn handlePull(self: *HttpApi, http_server: *std.http.Server, request: std.http.Server.Request) !void {
-        // TODO: Parse JSON body, trigger download, stream SSE progress
-        // For now, return a placeholder response
-        try self.sendJson(http_server, request, .ok, "{\"status\":\"pull not yet implemented via HTTP API\"}");
+        // Read the JSON body
+        var req = request;
+        var reader_buf: [4096]u8 = undefined;
+        const body_reader = req.readerExpectNone(&reader_buf);
+        var raw_buf: [4096]u8 = undefined;
+        const n = body_reader.readSliceShort(&raw_buf) catch 0;
+        const raw = raw_buf[0..n];
+
+        var parsed = std.json.parseFromSlice(pull_mod.PullRequest, self.allocator, raw, .{}) catch {
+            try self.sendJson(http_server, request, .bad_request, "{\"error\":\"invalid JSON body\"}");
+            return;
+        };
+        defer parsed.deinit();
+        const pr = parsed.value;
+        const revision = pr.revision orelse config.default_revision;
+
+        // Capture progress in buffers (SSE streaming is a later step)
+        var out_writer: Io.Writer.Allocating = .init(self.allocator);
+        defer out_writer.deinit();
+        var err_writer: Io.Writer.Allocating = .init(self.allocator);
+        defer err_writer.deinit();
+
+        const result = pull_mod.pullModel(
+            self.allocator,
+            self.io,
+            self.environ,
+            self.cfg,
+            pr.repo,
+            revision,
+            pr.file,
+            pr.digest,
+            null, // tracker
+            true, // p2p
+            &.{}, // direct peers
+            &out_writer.writer,
+            &err_writer.writer,
+        ) catch |err| {
+            var msg_buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "{{\"error\":\"pull failed: {}\"}}", .{err}) catch "{\"error\":\"pull failed\"}";
+            try self.sendJson(http_server, request, .internal_server_error, msg);
+            return;
+        };
+        defer self.allocator.free(result.snapshot_dir);
+
+        var resp_buf: [1024]u8 = undefined;
+        const resp = std.fmt.bufPrint(&resp_buf,
+            "{{\"status\":\"ready\",\"snapshot_dir\":\"{s}\",\"files\":{d}}}",
+            .{ result.snapshot_dir, result.files_downloaded },
+        ) catch "{\"status\":\"ready\"}";
+        try self.sendJson(http_server, request, .ok, resp);
     }
 
     fn handleStop(self: *HttpApi, http_server: *std.http.Server, request: std.http.Server.Request) !void {
@@ -357,7 +408,7 @@ test "HttpApi init" {
     defer cfg.deinit();
 
     var shutdown = std.atomic.Value(bool).init(false);
-    var api = HttpApi.init(std.testing.allocator, std.testing.io, &cfg, null, &shutdown);
+    var api = HttpApi.init(std.testing.allocator, std.testing.io, &cfg, std.testing.environ, null, &shutdown);
     try std.testing.expectEqual(@as(u64, 0), api.requests_served.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), api.xorbs_cached);
 }
@@ -367,7 +418,7 @@ test "HttpApi shutdown via flag" {
     defer cfg.deinit();
 
     var shutdown = std.atomic.Value(bool).init(false);
-    const api = HttpApi.init(std.testing.allocator, std.testing.io, &cfg, null, &shutdown);
+    const api = HttpApi.init(std.testing.allocator, std.testing.io, &cfg, std.testing.environ, null, &shutdown);
     _ = api;
     try std.testing.expect(!shutdown.load(.monotonic));
     shutdown.store(true, .release);
