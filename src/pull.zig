@@ -29,6 +29,37 @@ pub const PullRequest = struct {
     digest: ?[]const u8 = null,
 };
 
+/// One pin a caller is willing to see a local file become. The ready key IS
+/// repo+revision+file, and the digest is what makes an adoption a verification
+/// instead of a promise, so all four are required.
+pub const AdoptCandidate = struct {
+    repo: []const u8,
+    revision: []const u8,
+    file: []const u8,
+    digest: []const u8,
+};
+
+/// A request to adopt a file zest did not fetch (POST /v1/adopt).
+///
+/// The candidates are every pin the caller is prepared to see this file become.
+/// The file is hashed once and each digest is a compare against it, because the
+/// question an operator actually has is "which pin is this 20 GiB file?" — and
+/// answering it one pin at a time would hash the same bytes again per guess.
+pub const AdoptRequest = struct {
+    path: []const u8,
+    candidates: []const AdoptCandidate,
+};
+
+/// The verdict on a candidate file. `adopted` counts the pins the file became —
+/// every candidate whose digest equals the file's, since one set of weights may
+/// legitimately be recorded under more than one pin. Zero is a refusal, and it is
+/// the whole answer for a file that is not any of them.
+pub const AdoptOutcome = struct {
+    /// BLAKE3 of the file at `path`, owned by the caller.
+    actual_hex: []u8,
+    adopted: usize,
+};
+
 /// Download a model repo into the HF cache and return the snapshot dir.
 /// Progress goes to `stdout`, warnings/errors to `stderr` (the CLI passes the
 /// real streams; the HTTP handler can pass discard/buffer writers). `state`,
@@ -320,6 +351,184 @@ fn downloadRegularFile(
     try ensureParentDirs(io, output_path);
     try storage.writeFileAtomicAlloc(allocator, io, output_path, aw.written());
     if (state) |s| s.addBytes(aw.written().len);
+}
+
+/// Adopt a file zest did not fetch: hash it, and enter the ready registry ONLY
+/// when its BLAKE3 equals the pin's digest.
+///
+/// This is the second way into `ready` (draft 62). The invariant does not move —
+/// nothing is served that zest has not verified — but the bytes need not have
+/// travelled through zest: a box that already holds the pinned file (llama-swap's
+/// `-hf` pull, a reinstall over an existing volume, an artifact copied in by hand)
+/// can say so rather than download tens of gigabytes it already has.
+///
+/// `path` is resolved and must stay inside the models root — the parent of the HF
+/// cache. The API is reachable from the host and carries no auth (62 §exposure),
+/// so hashing a caller's arbitrary path would let anyone who can reach the port
+/// ask "what is the digest of /etc/shadow?".
+pub fn adoptLocalFile(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cfg: *const config.Config,
+    candidates: []const AdoptCandidate,
+    path: []const u8,
+) !AdoptOutcome {
+    if (candidates.len == 0) return error.NoCandidates;
+    for (candidates) |c| {
+        if (c.digest.len == 0) return error.MissingDigest;
+    }
+
+    const resolved = try std.fs.path.resolve(allocator, &.{path});
+    defer allocator.free(resolved);
+    const root = std.fs.path.dirname(cfg.hf_cache_dir) orelse cfg.hf_cache_dir;
+    if (!insideModelsRoot(resolved, root)) return error.PathOutsideModelsRoot;
+
+    const actual_hex = try computeBlake3Hex(allocator, io, resolved);
+    errdefer allocator.free(actual_hex);
+
+    var adopted: usize = 0;
+    for (candidates) |c| {
+        if (!std.mem.eql(u8, actual_hex, c.digest)) continue;
+        try ready_mod.markReady(allocator, io, cfg, c.repo, c.revision, c.file, c.digest);
+        adopted += 1;
+    }
+    return .{ .actual_hex = actual_hex, .adopted = adopted };
+}
+
+/// Is `path` at or below `root`? A bare prefix test would accept `/models-evil`
+/// for the root `/models`, so the byte after the prefix must be a separator.
+fn insideModelsRoot(path: []const u8, root: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    if (path.len == root.len) return true;
+    return path[root.len] == '/';
+}
+
+/// A scratch box: a models root under /tmp — which is what the path guard
+/// measures against — and a ready registry beside it. Each test gets its own
+/// root, and the registry file is removed first, so one test's entries cannot
+/// leak into another's count when the suite is re-run.
+fn adoptTestConfig(cfg: *config.Config, root: []const u8) !void {
+    std.testing.allocator.free(cfg.hf_cache_dir);
+    cfg.hf_cache_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/hf", .{root});
+    std.testing.allocator.free(cfg.ready_path);
+    cfg.ready_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/ready.json", .{root});
+    Io.Dir.deleteFileAbsolute(std.testing.io, cfg.ready_path) catch {};
+}
+
+test "adoptLocalFile records a file whose BLAKE3 is the pin's digest" {
+    var cfg = try config.Config.init(std.testing.allocator, std.testing.io, std.testing.environ);
+    defer cfg.deinit();
+    const root = "/tmp/zest_adopt_match";
+    try adoptTestConfig(&cfg, root);
+
+    const path = root ++ "/weights.gguf";
+    try storage.writeFileAtomic(std.testing.io, path, "the pinned bytes");
+    const digest = try computeBlake3Hex(std.testing.allocator, std.testing.io, path);
+    defer std.testing.allocator.free(digest);
+
+    const pins = [_]AdoptCandidate{.{ .repo = "org/name", .revision = "abc123", .file = "weights.gguf", .digest = digest }};
+    const outcome = try adoptLocalFile(std.testing.allocator, std.testing.io, &cfg, &pins, path);
+    defer std.testing.allocator.free(outcome.actual_hex);
+    try std.testing.expectEqual(@as(usize, 1), outcome.adopted);
+
+    var parsed = try ready_mod.list(std.testing.allocator, std.testing.io, &cfg);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.len);
+    try std.testing.expectEqualStrings("org/name", parsed.value[0].repo);
+    try std.testing.expectEqualStrings("abc123", parsed.value[0].revision);
+    try std.testing.expectEqualStrings("weights.gguf", parsed.value[0].file);
+    try std.testing.expectEqualStrings(digest, parsed.value[0].digest);
+}
+
+test "adoptLocalFile refuses a file that is not the pinned one" {
+    var cfg = try config.Config.init(std.testing.allocator, std.testing.io, std.testing.environ);
+    defer cfg.deinit();
+    const root = "/tmp/zest_adopt_mismatch";
+    try adoptTestConfig(&cfg, root);
+
+    const path = root ++ "/other.gguf";
+    try storage.writeFileAtomic(std.testing.io, path, "different bytes");
+
+    // The caller offers the pin it *thinks* this file is; the hash decides.
+    const pins = [_]AdoptCandidate{.{ .repo = "org/name", .revision = "abc123", .file = "weights.gguf", .digest = "00" }};
+    const outcome = try adoptLocalFile(std.testing.allocator, std.testing.io, &cfg, &pins, path);
+    defer std.testing.allocator.free(outcome.actual_hex);
+    try std.testing.expectEqual(@as(usize, 0), outcome.adopted);
+
+    // The verdict is the whole answer: a refusal writes nothing.
+    var parsed = try ready_mod.list(std.testing.allocator, std.testing.io, &cfg);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.len);
+}
+
+test "adoptLocalFile records every pin a file's digest answers to" {
+    var cfg = try config.Config.init(std.testing.allocator, std.testing.io, std.testing.environ);
+    defer cfg.deinit();
+    const root = "/tmp/zest_adopt_two_pins";
+    try adoptTestConfig(&cfg, root);
+
+    const path = root ++ "/shared.gguf";
+    try storage.writeFileAtomic(std.testing.io, path, "one set of weights, two names");
+    const digest = try computeBlake3Hex(std.testing.allocator, std.testing.io, path);
+    defer std.testing.allocator.free(digest);
+
+    // One artifact may legitimately be two pins — the same weights recorded under
+    // two names. A file hashed once has to be able to satisfy both, or an operator
+    // has to guess which name to adopt it as.
+    const pins = [_]AdoptCandidate{
+        .{ .repo = "org/name", .revision = "rev1", .file = "shared.gguf", .digest = digest },
+        .{ .repo = "org/name", .revision = "rev1", .file = "shared-alias.gguf", .digest = digest },
+        .{ .repo = "other/thing", .revision = "rev2", .file = "not-this.gguf", .digest = "00" },
+    };
+    const outcome = try adoptLocalFile(std.testing.allocator, std.testing.io, &cfg, &pins, path);
+    defer std.testing.allocator.free(outcome.actual_hex);
+    try std.testing.expectEqual(@as(usize, 2), outcome.adopted);
+
+    var parsed = try ready_mod.list(std.testing.allocator, std.testing.io, &cfg);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.len);
+}
+
+test "adoptLocalFile refuses a path outside the models root" {
+    var cfg = try config.Config.init(std.testing.allocator, std.testing.io, std.testing.environ);
+    defer cfg.deinit();
+    try adoptTestConfig(&cfg, "/tmp/zest_adopt_outside");
+
+    const pins = [_]AdoptCandidate{.{ .repo = "org/name", .revision = "abc", .file = "f.gguf", .digest = "00" }};
+    try std.testing.expectError(
+        error.PathOutsideModelsRoot,
+        adoptLocalFile(std.testing.allocator, std.testing.io, &cfg, &pins, "/etc/hostname"),
+    );
+    // A sibling directory that merely starts with the root's name is not inside it.
+    try std.testing.expectError(
+        error.PathOutsideModelsRoot,
+        adoptLocalFile(std.testing.allocator, std.testing.io, &cfg, &pins, "/tmp/zest_adopt_outside-evil/weights.gguf"),
+    );
+    // And `..` cannot walk out of the root either.
+    try std.testing.expectError(
+        error.PathOutsideModelsRoot,
+        adoptLocalFile(std.testing.allocator, std.testing.io, &cfg, &pins, "/tmp/zest_adopt_outside/../outside-evil/weights.gguf"),
+    );
+}
+
+test "adoptLocalFile refuses an empty digest" {
+    var cfg = try config.Config.init(std.testing.allocator, std.testing.io, std.testing.environ);
+    defer cfg.deinit();
+    try adoptTestConfig(&cfg, "/tmp/zest_adopt_nodigest");
+
+    // No digest means nothing to verify against, and an unverified file is not
+    // adoptable — that is the one thing adoption may not relax (draft 62).
+    const undigested = [_]AdoptCandidate{.{ .repo = "org/name", .revision = "abc", .file = "f.gguf", .digest = "" }};
+    try std.testing.expectError(
+        error.MissingDigest,
+        adoptLocalFile(std.testing.allocator, std.testing.io, &cfg, &undigested, "/tmp/zest_adopt_nodigest/whatever.gguf"),
+    );
+    // And a request that names no pin is a caller error, not a quiet no-op.
+    const none = [_]AdoptCandidate{};
+    try std.testing.expectError(
+        error.NoCandidates,
+        adoptLocalFile(std.testing.allocator, std.testing.io, &cfg, &none, "/tmp/zest_adopt_nodigest/whatever.gguf"),
+    );
 }
 
 /// Compute the BLAKE3 hex digest of a file (streamed — no full read into memory).

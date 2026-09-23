@@ -4,6 +4,7 @@
 ///   GET  /v1/health  — simple health check
 ///   GET  /v1/status  — server stats as JSON
 ///   POST /v1/pull    — trigger model download (JSON body)
+///   POST /v1/adopt   — certify a pinned file the box already has (JSON body)
 ///   POST /v1/stop    — graceful shutdown
 ///
 /// Uses std.http.Server for per-connection HTTP handling.
@@ -123,6 +124,8 @@ pub const HttpApi = struct {
             } else {
                 try self.handlePull(http_server, request);
             }
+        } else if (std.mem.eql(u8, target, "/v1/adopt")) {
+            try self.handleAdopt(http_server, request);
         } else if (std.mem.eql(u8, target, "/v1/models")) {
             try self.handleModels(http_server, request);
         } else if (std.mem.eql(u8, target, "/") or std.mem.eql(u8, target, "/ui")) {
@@ -196,6 +199,85 @@ pub const HttpApi = struct {
         const resp = std.fmt.bufPrint(&resp_buf, "{{\"id\":\"{s}\",\"status\":\"started\"}}", .{ps.id}) catch
             "{\"status\":\"started\"}";
         try self.sendJson(http_server, request, .accepted, resp);
+    }
+
+    /// POST /v1/adopt — certify a file zest did not fetch. Hashing a 20 GiB
+    /// artifact takes seconds, so this answers when the work is done rather than
+    /// handing back an id: the caller has one question ("are these bytes the
+    /// pin?") and gets one verdict plus the digest zest computed.
+    ///
+    /// Nothing is registered unless the digests agree — adoption is a second way
+    /// into `ready`, never a way around verifying (draft 62).
+    fn handleAdopt(self: *HttpApi, http_server: *std.http.Server, request: std.http.Server.Request) !void {
+        var req = request;
+        var reader_buf: [4096]u8 = undefined;
+        const body_reader = req.readerExpectNone(&reader_buf);
+        // 8 KiB holds a handful of pins with room to spare. A larger body fails to
+        // parse and answers 400, which is loud — not a silently truncated list of
+        // candidates that would quietly adopt fewer pins than asked.
+        var raw_buf: [8192]u8 = undefined;
+        const n = body_reader.readSliceShort(&raw_buf) catch 0;
+        const raw = raw_buf[0..n];
+
+        var parsed = std.json.parseFromSlice(pull_mod.AdoptRequest, self.allocator, raw, .{}) catch {
+            try self.sendJson(http_server, request, .bad_request, "{\"error\":\"invalid JSON body\"}");
+            return;
+        };
+        defer parsed.deinit();
+        const ar = parsed.value;
+
+        for (ar.candidates) |c| {
+            if (!isBlake3Hex(c.digest)) {
+                try self.sendJson(http_server, request, .bad_request, "{\"error\":\"every candidate needs a 64-character BLAKE3 digest\"}");
+                return;
+            }
+        }
+
+        const outcome = pull_mod.adoptLocalFile(self.allocator, self.io, self.cfg, ar.candidates, ar.path) catch |err| switch (err) {
+            error.NoCandidates, error.MissingDigest => {
+                try self.sendJson(http_server, request, .bad_request, "{\"error\":\"adopt needs a path and at least one candidate pin with a digest\"}");
+                return;
+            },
+            error.PathOutsideModelsRoot => {
+                try self.sendJson(http_server, request, .forbidden, "{\"error\":\"path is outside the models root\"}");
+                return;
+            },
+            error.FileNotFound => {
+                try self.sendJson(http_server, request, .not_found, "{\"error\":\"no file at that path\"}");
+                return;
+            },
+            else => {
+                try self.sendJson(http_server, request, .internal_server_error, "{\"error\":\"hashing failed\"}");
+                return;
+            },
+        };
+        defer self.allocator.free(outcome.actual_hex);
+
+        if (outcome.adopted == 0) {
+            // Loud, with the digest the bytes actually have: the file is none of
+            // the pins offered, and a quiet "not adopted" would be the silent
+            // degradation this repo has already paid for once.
+            var mismatch_buf: [256]u8 = undefined;
+            const body = std.fmt.bufPrint(&mismatch_buf, "{{\"status\":\"mismatch\",\"digest\":\"{s}\"}}", .{outcome.actual_hex}) catch "{\"status\":\"mismatch\"}";
+            try self.sendJson(http_server, request, .conflict, body);
+            return;
+        }
+
+        var ok_buf: [256]u8 = undefined;
+        const ok_body = std.fmt.bufPrint(&ok_buf, "{{\"status\":\"ready\",\"digest\":\"{s}\",\"adopted\":{d}}}", .{ outcome.actual_hex, outcome.adopted }) catch "{\"status\":\"ready\"}";
+        try self.sendJson(http_server, request, .ok, ok_body);
+    }
+
+    /// A BLAKE3 digest in hex is exactly 64 lowercase hex characters. Checking it
+    /// at the boundary means a truncated or mistyped digest is a caller error with
+    /// a clear answer, rather than a comparison that can only ever say "no".
+    fn isBlake3Hex(s: []const u8) bool {
+        if (s.len != 64) return false;
+        for (s) |ch| {
+            const is_hex = (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f');
+            if (!is_hex) return false;
+        }
+        return true;
     }
 
     /// Route a /v1/pull/{id}/… path to progress or cancel.
