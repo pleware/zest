@@ -389,10 +389,47 @@ pub fn adoptLocalFile(
     var adopted: usize = 0;
     for (candidates) |c| {
         if (!std.mem.eql(u8, actual_hex, c.digest)) continue;
+        try linkIntoHfShelf(allocator, io, cfg, c.repo, c.revision, c.file, resolved);
         try ready_mod.markReady(allocator, io, cfg, c.repo, c.revision, c.file, c.digest);
         adopted += 1;
     }
     return .{ .actual_hex = actual_hex, .adopted = adopted };
+}
+
+/// Make the adopted file reachable at the path the generated roster serves from.
+///
+/// A pull writes the artifact into the HF shelf, and the roster points `-m` at
+/// `hf_cache_dir/models--<org>--<repo>/snapshots/<rev>/<file>`
+/// (`Config.modelSnapshotDir`). An adopted file lives wherever the operator left
+/// it — llama-swap's `-hf` download at the volume root, an artifact copied in by
+/// hand — so a ready entry for it would name a path llama-server cannot open, and
+/// the box would report a model it cannot load. Link the file into the shelf
+/// rather than copying it: the bytes stay where they are, and there stays one
+/// layout for every consumer to read (HF's own, symlinks and all).
+///
+/// Deliberately called even when the registry already holds the pin: the entry is
+/// the claim, the link is what makes it loadable, and re-adopting an old entry is
+/// how a box repairs itself after this fix.
+fn linkIntoHfShelf(
+    allocator: std.mem.Allocator,
+    io: Io,
+    cfg: *const config.Config,
+    repo: []const u8,
+    revision: []const u8,
+    file: []const u8,
+    source: []const u8,
+) !void {
+    const dir = try cfg.modelSnapshotDir(repo, revision);
+    defer allocator.free(dir);
+    const link_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, file });
+    defer allocator.free(link_path);
+
+    // Already materialized — by a pull, or by an earlier adoption. Whatever is
+    // there is the pin's bytes (a pull verifies before writing), so leave it.
+    Io.Dir.accessAbsolute(io, link_path, .{}) catch {
+        try storage.ensureDirRecursive(io, dir);
+        try Io.Dir.symLinkAbsolute(io, source, link_path, .{});
+    };
 }
 
 /// Is `path` at or below `root`? A bare prefix test would accept `/models-evil`
@@ -426,10 +463,24 @@ test "adoptLocalFile records a file whose BLAKE3 is the pin's digest" {
     const digest = try computeBlake3Hex(std.testing.allocator, std.testing.io, path);
     defer std.testing.allocator.free(digest);
 
+    // A ready entry has to be loadable: the roster points `-m` at the HF shelf, so
+    // the adopted file must be reachable exactly there — as a link to where the
+    // bytes already are, not a second copy of them. The link is removed first, so
+    // this test is about what the adopt call does and not about leftovers from an
+    // earlier run in the same /tmp path.
+    const shelf = try std.fmt.allocPrint(std.testing.allocator, "{s}/hf/models--org--name/snapshots/abc123/weights.gguf", .{root});
+    defer std.testing.allocator.free(shelf);
+    Io.Dir.deleteFileAbsolute(std.testing.io, shelf) catch {};
+
     const pins = [_]AdoptCandidate{.{ .repo = "org/name", .revision = "abc123", .file = "weights.gguf", .digest = digest }};
     const outcome = try adoptLocalFile(std.testing.allocator, std.testing.io, &cfg, &pins, path);
     defer std.testing.allocator.free(outcome.actual_hex);
     try std.testing.expectEqual(@as(usize, 1), outcome.adopted);
+
+    try Io.Dir.accessAbsolute(std.testing.io, shelf, .{});
+    var link_buf: [512]u8 = undefined;
+    const link_len = try Io.Dir.readLinkAbsolute(std.testing.io, shelf, &link_buf);
+    try std.testing.expectEqualStrings(path, link_buf[0..link_len]);
 
     var parsed = try ready_mod.list(std.testing.allocator, std.testing.io, &cfg);
     defer parsed.deinit();
