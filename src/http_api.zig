@@ -54,7 +54,12 @@ pub const HttpApi = struct {
 
     /// Start listening and handling HTTP requests. Blocks until shutdown.
     pub fn run(self: *HttpApi) !void {
-        const addr: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(self.cfg.http_port) };
+        // The address comes from the config (`ZEST_HTTP_HOST`, `--http-host`):
+        // loopback by default, and 0.0.0.0 on the box, where the CLI drives the
+        // pull from outside the container. A value that will not parse must not
+        // open the API somewhere unintended, so it falls back to loopback.
+        const addr: net.IpAddress = net.IpAddress.parseLiteral(self.cfg.http_addr) catch
+            .{ .ip4 = net.Ip4Address.loopback(self.cfg.http_port) };
         var listener = try addr.listen(self.io, .{
             .reuse_address = true,
         });

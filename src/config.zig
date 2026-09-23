@@ -8,6 +8,13 @@ pub const default_revision = "main";
 pub const default_dht_port: u16 = 6881;
 pub const default_listen_port: u16 = 6881;
 pub const default_http_port: u16 = 9847;
+/// Loopback by default: a standalone zest exposes its API to its own machine
+/// and nothing else. The box's compose sets `ZEST_HTTP_HOST=0.0.0.0`, because
+/// there the CLI drives `pware backend data` and `fleet sync` from outside the
+/// container — and while the listener sits on the container's loopback the
+/// published `9847:9847` is a dead forward, so the roster quietly comes out
+/// empty (drafts/62).
+pub const default_http_host = "127.0.0.1";
 pub const default_max_peers: u16 = 50;
 pub const default_chunk_target_size: u32 = 65536; // 64KB — matches HF Xet CDC chunk size
 pub const default_max_concurrent_downloads: u32 = 16;
@@ -30,6 +37,11 @@ pub const Config = struct {
     dht_port: u16,
     listen_port: u16,
     http_port: u16,
+    /// Owned. What the HTTP API binds, as `host:port` — built once here and
+    /// rebuilt as a whole by `setHttpHost` / `setHttpPort`, so the listener
+    /// never derives an address from half-updated pieces.
+    http_addr: []const u8,
+    http_host: []const u8,
     max_peers: u16,
     chunk_target_size: u32,
     pid_file_path: []const u8,
@@ -61,6 +73,10 @@ pub const Config = struct {
         else
             default_http_port;
 
+        const http_host = (try getEnv(environ, allocator, "ZEST_HTTP_HOST")) orelse
+            try allocator.dupe(u8, default_http_host);
+        const http_addr = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ http_host, http_port });
+
         const max_peers_str = try getEnv(environ, allocator, "ZEST_MAX_PEERS");
         defer if (max_peers_str) |p| allocator.free(p);
         const max_peers = if (max_peers_str) |p|
@@ -80,6 +96,8 @@ pub const Config = struct {
             .dht_port = default_dht_port,
             .listen_port = default_listen_port,
             .http_port = http_port,
+            .http_addr = http_addr,
+            .http_host = http_host,
             .max_peers = max_peers,
             .chunk_target_size = default_chunk_target_size,
             .pid_file_path = pid_file_path,
@@ -95,6 +113,29 @@ pub const Config = struct {
         self.allocator.free(self.chunk_cache_dir);
         self.allocator.free(self.cache_dir);
         self.allocator.free(self.hf_cache_dir);
+        self.allocator.free(self.http_addr);
+        self.allocator.free(self.http_host);
+    }
+
+    /// Move the HTTP API to another host — `0.0.0.0` when something outside the
+    /// container has to reach it. The address is rebuilt after the new host and
+    /// the old pair is freed only once the new one exists, so a failure leaves
+    /// the config as it was rather than pointing at a freed string.
+    pub fn setHttpHost(self: *Config, host: []const u8) !void {
+        const owned = try self.allocator.dupe(u8, host);
+        errdefer self.allocator.free(owned);
+        const addr = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ owned, self.http_port });
+        self.allocator.free(self.http_host);
+        self.allocator.free(self.http_addr);
+        self.http_host = owned;
+        self.http_addr = addr;
+    }
+
+    pub fn setHttpPort(self: *Config, port: u16) !void {
+        const addr = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ self.http_host, port });
+        self.allocator.free(self.http_addr);
+        self.http_addr = addr;
+        self.http_port = port;
     }
 
     /// Build the HF cache path for a model snapshot:
@@ -178,6 +219,18 @@ test "Config init and deinit" {
     try std.testing.expect(cfg.cache_dir.len > 0);
     try std.testing.expect(cfg.hf_cache_dir.len > 0);
     try std.testing.expect(cfg.xorb_cache_dir.len > 0);
+}
+
+test "the HTTP API address follows the host and the port" {
+    var cfg = try Config.init(std.testing.allocator, std.testing.io, std.testing.environ);
+    defer cfg.deinit();
+    // Loopback unless the environment says otherwise: a standalone zest exposes
+    // nothing, and the box opts out with ZEST_HTTP_HOST=0.0.0.0.
+    try std.testing.expectEqualStrings("127.0.0.1:9847", cfg.http_addr);
+    try cfg.setHttpHost("0.0.0.0");
+    try std.testing.expectEqualStrings("0.0.0.0:9847", cfg.http_addr);
+    try cfg.setHttpPort(9899);
+    try std.testing.expectEqualStrings("0.0.0.0:9899", cfg.http_addr);
 }
 
 test "modelSnapshotDir" {

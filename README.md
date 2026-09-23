@@ -110,6 +110,10 @@ zest serve
 # custom ports
 zest serve --http-port 8080 --listen-port 7000
 
+# reachable from outside the container: the box sets this and publishes 9847,
+# because its CLI drives the pull and reads the ready registry from the host
+zest serve --http-host 0.0.0.0
+
 # start/stop as background service
 zest start
 zest stop

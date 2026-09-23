@@ -275,7 +275,13 @@ fn cmdServe(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wr
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--http-port")) {
             i += 1;
-            if (i < args.len) cfg.http_port = std.fmt.parseInt(u16, args[i], 10) catch cfg.http_port;
+            if (i < args.len) {
+                const port = std.fmt.parseInt(u16, args[i], 10) catch cfg.http_port;
+                cfg.setHttpPort(port) catch {};
+            }
+        } else if (std.mem.eql(u8, args[i], "--http-host")) {
+            i += 1;
+            if (i < args.len) cfg.setHttpHost(args[i]) catch {};
         } else if (std.mem.eql(u8, args[i], "--listen-port")) {
             i += 1;
             if (i < args.len) cfg.listen_port = std.fmt.parseInt(u16, args[i], 10) catch cfg.listen_port;
@@ -289,7 +295,7 @@ fn cmdServe(allocator: std.mem.Allocator, init: std.process.Init, stdout: *Io.Wr
 
     try stdout.print("zest server v{s}\n", .{version});
     try stdout.print("  BT listen port: {d}\n", .{cfg.listen_port});
-    try stdout.print("  HTTP API port:  {d}\n", .{cfg.http_port});
+    try stdout.print("  HTTP API addr:  {s}\n", .{cfg.http_addr});
     try stdout.print("  Peer ID:        {s}...\n", .{peer_id_mod.CLIENT_PREFIX});
     try stdout.print("  Cached xorbs:   {d}\n", .{registry.count()});
     try stdout.print("\nServer running. Press Ctrl+C to stop.\n", .{});
@@ -504,6 +510,7 @@ fn printUsage(w: *Io.Writer) void {
         \\
         \\Serve options:
         \\  --http-port <port>       HTTP API port (default: 9847)
+        \\  --http-host <host>       HTTP API host (default: 127.0.0.1, ZEST_HTTP_HOST)
         \\  --listen-port <port>     BT listen port (default: 6881)
         \\
         \\Bench options:
